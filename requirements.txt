@@ -1,0 +1,6 @@
+# Development / linting toolchain.
+# The simulation itself runs on the Python standard library only:
+# no graph library is used, as required by the subject.
+flake8>=7.0
+mypy>=1.9
+pytest>=8.0
