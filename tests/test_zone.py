@@ -23,6 +23,7 @@ def test_normal_and_priority_cost_one_turn() -> None:
 
 
 def test_blocked_zone_is_not_passable() -> None:
+    """Drones may never enter a blocked zone."""
     assert not ZoneType.BLOCKED.is_passable
 
 
@@ -33,5 +34,6 @@ def test_start_hub_ignores_declared_capacity() -> None:
 
 
 def test_ordinary_zone_reports_declared_capacity() -> None:
+    """Outside the start and end hubs, max_drones is the capacity."""
     zone = Zone("hub1", 1, 0, max_drones=2)
     assert zone.capacity == 2

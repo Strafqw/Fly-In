@@ -26,12 +26,16 @@ library; `flake8`, `mypy` and `pytest` are development dependencies.
 
 ```bash
 make install          # create a virtualenv and install the toolchain
-make run              # run on the default map
-make lint             # flake8 + mypy
+make run              # run on the default map (MAP=<path> to change)
+make visual           # same, with the colour grid view and metrics
+make lint             # flake8 + mypy (installs the toolchain if needed)
 make test             # unit tests
 make bench            # every provided map, with turn counts
-make clean            # remove caches
+make clean            # remove caches and the virtualenv
 ```
+
+`run`, `visual`, `debug` and `bench` only need the standard library, so
+they use the system `python3` and work even without `make install`.
 
 Running directly:
 
@@ -44,7 +48,7 @@ python3 main.py maps/easy/01_linear_path.txt --turns-only
 
 | flag | effect |
 |---|---|
-| `--solver NAME` | routing strategy (default `shortest`) |
+| `--solver NAME` | routing strategy: `reservation` (default) or the `shortest` baseline |
 | `--visual` | colour coded grid animation instead of raw output |
 | `--stats` | secondary metrics, on stderr |
 | `--turns-only` | print just the turn count, for scripting |
@@ -99,7 +103,7 @@ main.py        CLI: parse -> solve -> validate -> render
  │   ├── zone.py         Zone, ZoneType, capacity and cost rules
  │   └── connection.py   Connection: identity, naming, traversal
  │
- ├── solver.py      Network -> Plan             (strategy, abstract base)
+ ├── solver.py      Network -> Plan             (strategies, abstract base)
  ├── plan.py        Move / Turn / Plan          (the shared vocabulary)
  ├── simulator.py   Plan    -> Metrics          (the referee)
  ├── renderer.py    Plan    -> screen           (abstract base)
@@ -114,8 +118,9 @@ that decides anything; the simulator is the only place that judges.
 
 Three genuine polymorphic hierarchies, not classes used as namespaces:
 
-- **`Solver`** (abstract) → `ShortestPathSolver`. Adding a strategy
-  means adding a subclass; `main.py` and the simulator are unchanged.
+- **`Solver`** (abstract) → `ReservationSolver`, `ShortestPathSolver`.
+  Adding a strategy means adding a subclass; `main.py` and the
+  simulator are unchanged.
 - **`Renderer`** (abstract) → `PlainRenderer`, `GridRenderer`. The same
   plan renders as machine readable text or as an animation.
 - **`FlyInError`** → `ParseError`, `ValidationError`,
@@ -123,57 +128,93 @@ Three genuine polymorphic hierarchies, not classes used as namespaces:
   catches every user facing failure; programming mistakes still raise
   built-in exceptions so they surface as tracebacks.
 
+`main.py` is the `FlyInApp` class; the only module-level code is the
+`if __name__ == "__main__"` guard that instantiates it.
+
 `ZoneType` is an enum rather than a class hierarchy, because the four
 types differ in *data* (cost, passability) rather than in behaviour.
 
 ## Algorithm
 
-### Pathfinding — Dijkstra, not BFS
+The default strategy, `ReservationSolver`, plans drones **one at a
+time through space and time**, each around the drones already planned.
+The `ShortestPathSolver` baseline is kept for comparison
+(`--solver shortest`).
 
-Entering a `restricted` zone costs two turns, so edges are weighted and
-breadth-first search gives the wrong answer. `medium/03_priority_puzzle`
-proves it: two routes with an identical **four hops** but costs of four
-and five turns. BFS would consider them equivalent and could return the
-slower one — no crash, just a worse score.
+### Reservation tables
 
-The search key is `(cost, -priority_zones_seen)`. Python compares tuples
-left to right, so cost decides the route and the second term only breaks
-ties. This is how the subject's *"priority zones should be prioritized"*
-is honoured **without** making them cheaper, which would break the
-integer turn model the whole simulation rests on.
+The solver keeps two counters, filled in as drones are planned:
+
+- `zone_use[(zone, turn)]` — drones standing in a zone at the end of a
+  turn, limited by `max_drones` (start and end hubs are unlimited);
+- `link_use[(link, turn)]` — drones crossing a connection during a
+  turn, limited by `max_link_capacity`. A restricted crossing holds
+  its link for **both** turns.
+
+A drone may only use what earlier drones left free, so no plan can
+ever exceed a capacity, and capacities above 1 are actually used.
+
+### Space-time search — A\*
+
+Each drone searches over `(zone, turn)` states. From a state it may:
+
+- **wait** — stay where it is for a turn, if the zone has room on the
+  next turn (at the start hub, which is unlimited, it jumps straight to
+  the next turn at which some exit is free);
+- **move** to a neighbouring zone, if the link has room on every turn
+  of the crossing and the destination has room on arrival — a drone may
+  never wait on a connection.
+
+Because waiting is just another move, *strategic waiting* comes for
+free, and once the short route is booked the next drone's earliest
+arrival naturally goes another way — the fleet **spreads across
+several paths** without any explicit path splitting.
+
+The search is A\* ordered by `turn + cost_to_end(zone)`.
+`cost_to_end` comes from one reverse Dijkstra from the end hub,
+weighted by entry cost (restricted = 2). It never overestimates, so
+the first time the end hub comes off the queue is this drone's
+earliest possible arrival. Zones that cannot reach the end at all are
+absent from that table and never entered, which prunes dead ends.
+
+Ties are broken in favour of routes through more `priority` zones:
+the queue key is `(estimate, -priority_zones_seen, ...)`, and tuples
+compare left to right, so arrival time still decides and priority only
+breaks ties. That honours *"priority zones should be prioritized"*
+without making them cheaper, which would break the integer turn model.
 
 `heapq` provides the priority queue. It is a general purpose data
-structure, not graph logic; every traversal is written from scratch, as
-the subject requires.
+structure, not graph logic; every traversal is written from scratch,
+as the subject requires.
 
-Complexity: `O(E log V)` time, `O(V)` memory. The path is computed once
-and cached in the plan, never recomputed per drone.
+### Why it cannot deadlock
 
-### Scheduling
+A drone only ever books slots that are free, and it never gives back
+a slot it booked. The start hub has unlimited room, so the worst case
+for any drone is to wait there until the network has cleared — a
+route always exists if the end is reachable at all.
 
-Drones are released down the chosen route at a fixed interval and walk
-it step by step. A restricted step emits two moves — one on the
-connection, one on arrival — and advances the clock by two turns.
+### Complexity
 
-The release interval is `2` when the route contains a restricted zone
-and `1` otherwise, because a restricted crossing occupies its
-connection for both turns of the transit. **This is a known
-inefficiency**: one restricted zone anywhere slows the whole fleet for
-the entire journey, even across sections that are wide open.
+- Static costs: one Dijkstra, `O(E log V)`.
+- Per drone: an A\* over the states it actually explores, roughly its
+  path length plus the waiting it needs. Reservations only grow, so
+  the earliest free exit from the start is remembered between drones
+  instead of being rescanned (`_floor`), which keeps a large fleet
+  linear.
+- Memory: the two reservation counters, one entry per (zone or link,
+  turn) actually used — proportional to the total number of moves.
 
-### Known limitations
+Measured: 50 000 drones on a two-corridor map in about 1.4 s.
 
-- **Only one route is used.** `easy/02_simple_fork` offers two branches
-  and this solver uses one. A max-flow based solver would split the
-  fleet across both.
-- **Capacities are not exploited.** `max_drones` and
-  `max_link_capacity` are never read by the solver. Releasing one drone
-  per turn can never exceed a limit of one or more, so plans are
-  *correct* — but `easy/03_basic_capacity` has zones rated for two and
-  three drones and links rated for four, all under-used.
+### Limitations
 
-Both are what a flow based solver exists to fix, and the abstract
-`Solver` base is already in place for it.
+Planning one drone at a time is greedy: an early drone takes the best
+slot for itself, which is not always best for the fleet as a whole.
+On every provided map this reaches or beats the reference — the
+challenger map is solved in 43 turns, which is the theoretical floor
+(see Performance) — but an adversarial map could exist where a joint
+optimisation does better.
 
 ### Verification
 
@@ -197,7 +238,9 @@ separate is what lets a disagreement surface.
 Occupancy is checked on the state **after** the whole turn is applied,
 never move by move, because the subject says a departing drone frees
 its space during the same turn — so a full corridor may shift forward
-at once.
+at once. It is kept as a running count updated by each move, so
+validating a turn costs time proportional to the moves in it, not to
+the size of the fleet.
 
 ## Visual representation
 
@@ -207,9 +250,9 @@ coordinates, one frame per turn.
 ```
 turn 3
                  loop_d        loop_c
-   start:4       loop_a:1      loop_b       !exit_point    goal
+   start:1       loop_a:2      loop_b:2     !exit_point    goal
   in flight: D1->loop_b-exit_point
-  moves: D1-loop_b-exit_point D2-loop_a
+  moves: D1-loop_b-exit_point D3-loop_b D5-loop_a
 ```
 
 - each zone sits at its own coordinates, so the **shape** of the map is
@@ -221,6 +264,10 @@ turn 3
 - `+` marks a priority zone, `!` restricted, `#` blocked
 - drones crossing a connection are listed on their own line, because
   during that turn they occupy **no zone at all**
+- zones declared on the same coordinates as another are listed on a
+  `stacked:` line, so no zone is ever hidden
+- `make visual` adds the secondary metrics (`--stats`): moves per
+  turn, average turns per drone, total path cost
 
 What this adds over the raw `D1-roof1` output: bottlenecks become
 visible. You can watch drones back up behind a capacity-1 zone, see one
@@ -262,23 +309,27 @@ first.
 | map | drones | turns | target | |
 |---|---|---|---|---|
 | easy/01_linear_path | 2 | 4 | ≤ 6 | ✅ |
-| easy/02_simple_fork | 4 | 6 | ≤ 8 | ✅ |
-| easy/03_basic_capacity | 4 | 6 | ≤ 6 | ✅ |
+| easy/02_simple_fork | 4 | 4 | ≤ 8 | ✅ |
+| easy/03_basic_capacity | 4 | 4 | ≤ 6 | ✅ |
 | medium/01_dead_end_trap | 5 | 8 | ≤ 12 | ✅ |
 | medium/02_circular_loop | 6 | 15 | ≤ 15 | ✅ |
-| medium/03_priority_puzzle | 5 | 8 | ≤ 12 | ✅ |
+| medium/03_priority_puzzle | 5 | 7 | ≤ 12 | ✅ |
 | hard/01_maze_nightmare | 8 | 13 | ≤ 30 | ✅ |
 | hard/02_capacity_hell | 12 | 16 | ≤ 35 | ✅ |
 | hard/03_ultimate_challenge | 15 | 26 | ≤ 45 | ✅ |
-| challenger/the_impossible_dream | 25 | 67 | 45 | ❌ |
+| challenger/the_impossible_dream | 25 | 43 | record 45 | ✅ |
 
-Every mandatory target is met. The challenger map is not solved
-competitively: its entry gate admits one drone per turn and the
-cost-minimal route is 19 turns, giving a theoretical floor of **43
-turns**. Reaching that needs the fleet spread across several parallel
-routes, which the single-path solver cannot do.
+Every target is met or beaten, including the bonus: the challenger
+map's entry gate admits one drone per turn and its cost-minimal route
+is 19 turns, so **43 turns is the theoretical floor** — and that is
+what the solver reaches.
 
-Reproduce with `make bench`.
+For comparison, the single-path baseline (`--solver shortest`) needs
+6 turns on both `simple_fork` and `basic_capacity`, and 67 on the
+challenger map.
+
+Reproduce with `make bench`; `make test` checks every map against its
+target.
 
 ## Resources
 
@@ -287,8 +338,11 @@ Reproduce with `make bench`.
 - Ford, L. R. & Fulkerson, D. R. — *Constructing Maximal Dynamic Flows
   from Static Flows* (1958). Flows over time; the basis for a
   makespan-optimal solver.
-- Dinic, Y. — *Algorithm for Solution of a Problem of Maximum Flow*
-  (1970). Max-flow, for the planned multi-path solver.
+- Silver, D. — *Cooperative Pathfinding* (2005). Space-time A\* with a
+  reservation table; the approach `ReservationSolver` follows.
+- Hart, P. E., Nilsson, N. J. & Raphael, B. — *A Formal Basis for the
+  Heuristic Determination of Minimum Cost Paths* (1968). The A\*
+  algorithm and why an admissible heuristic finds an optimal path.
 - 42's *lem-in* project — the same core problem without edge weights or
   edge capacities; a useful source of prior art on distributing a fleet
   across several paths.
@@ -319,6 +373,14 @@ tool rather than as a code generator of last resort. Specifically:
 - **Code written by Claude**, reviewed and understood before being
   kept: the parser's helper methods, the simulator, `renderer.py`,
   `main.py`, and parts of this README.
+- **Pre-submission pass by Claude**, reviewed together line by line
+  afterwards: a full test of the project against the subject (an
+  independent output checker and some forty edge-case maps), then the
+  fixes it led to — `ReservationSolver` (space-time A\* with
+  reservation tables), the incremental occupancy count in the
+  simulator and renderer, the `FlyInApp` class, clean handling of
+  non-UTF-8 files and closed pipes, the Makefile rework, and the
+  parser, solver and simulator tests.
 
 The data model, the graph container, the Dijkstra implementation and
-the test suite were written by hand, with Claude reviewing.
+the original test suite were written by hand, with Claude reviewing.

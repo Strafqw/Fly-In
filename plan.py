@@ -1,6 +1,6 @@
 """Data produced by a solver and consumed by the simulator."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -51,11 +51,13 @@ class Turn:
     Attributes:
         index: 1-based turn number.
         moves: The moves executed this turn. Drones that stay put are
-            omitted, as the subject requires.
+            omitted, as the subject requires. A tuple rather than a
+            list, so the frozen dataclass is immutable all the way
+            down.
     """
 
     index: int
-    moves: list[Move] = field(default_factory=list)
+    moves: tuple[Move, ...] = ()
 
     def __str__(self) -> str:
         """Render the turn as one line of the simulation output.
@@ -74,7 +76,7 @@ class Plan:
         turns: The ordered simulation turns.
     """
 
-    turns: list[Turn] = field(default_factory=list)
+    turns: tuple[Turn, ...] = ()
 
     @property
     def turn_count(self) -> int:

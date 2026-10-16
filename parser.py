@@ -24,12 +24,19 @@ class MapParser:
             The parsed and validated network.
 
         Raises:
-            ParseError: If the file does not respect the format.
+            ParseError: If the file does not respect the format, or is
+                not UTF-8 text at all.
             ValidationError: If the map is semantically invalid.
             OSError: If the file cannot be read.
         """
-        with open(path, "r", encoding="utf-8") as handle:
-            return self.parse_lines(handle.read().splitlines())
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except UnicodeDecodeError as error:
+            raise ParseError(
+                f"not a UTF-8 text file (byte {error.start}: {error.reason})"
+            ) from None
+        return self.parse_lines(lines)
 
     def parse_lines(self, lines: list[str]) -> Network:
         """Parse a map from a list of raw lines.
@@ -70,6 +77,8 @@ class MapParser:
                     network.add_connection(
                         self._parse_connection(text, number, raw)
                     )
+                elif text.startswith("nb_drones:"):
+                    raise ParseError("nb_drones declared twice", number, raw)
                 else:
                     raise ParseError("unknown directive", number, raw)
             except ValidationError as error:
@@ -114,7 +123,7 @@ class MapParser:
         is_start: bool = False,
         is_end: bool = False,
     ) -> Zone:
-        """Parse a ``start_hub:``, ``end_hub:`` or ``hmadeub:`` line.
+        """Parse a ``start_hub:``, ``end_hub:`` or ``hub:`` line.
 
         Args:
             text: The cleaned line.

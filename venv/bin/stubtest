@@ -1,4 +1,4 @@
-#!/home/sampipampi/Fly-In/venv/bin/python3
+#!/home/sampipampi/Fly-In/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

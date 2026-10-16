@@ -29,6 +29,7 @@ PER_MODULE_OPTIONS: Final = {
     "allow_untyped_globals",
     "always_false",
     "always_true",
+    "check_unreachable",
     "check_untyped_defs",
     "debug_cache",
     "disable_error_code",
@@ -172,6 +173,9 @@ class Options:
 
         # Disallow defining incompletely typed functions
         self.disallow_incomplete_defs = False
+
+        # Type check unreachable code
+        self.check_unreachable = False
 
         # Type check unannotated functions
         self.check_untyped_defs = False
@@ -385,8 +389,8 @@ class Options:
         self.logical_deps = False
         # If True, partial types can't span a module top level and a function
         self.local_partial_types = True
-        # If True, use the native parser (experimental)
-        self.native_parser = False
+        # If True, use the native parser
+        self.native_parser = True
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

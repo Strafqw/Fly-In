@@ -2,8 +2,8 @@ import sys
 from _typeshed import SupportsWrite, sentinel
 from collections.abc import Callable, Generator, Iterable, Sequence
 from re import Pattern
-from typing import IO, Any, ClassVar, Final, Generic, NewType, NoReturn, Protocol, TypeAlias, TypeVar, overload, type_check_only
-from typing_extensions import Self, deprecated
+from typing import IO, Any, ClassVar, Final, Generic, NewType, Protocol, TypeAlias, TypeVar, overload, type_check_only
+from typing_extensions import Never, Self, deprecated
 
 __all__ = [
     "ArgumentParser",
@@ -105,7 +105,7 @@ class _ActionsContainer:
         conflict_handler: str = ...,
     ) -> _ArgumentGroup: ...
     @overload
-    @deprecated("The `prefix_chars` parameter deprecated since Python 3.14.")
+    @deprecated("The `prefix_chars` parameter is deprecated.")
     def add_argument_group(
         self,
         title: str | None = None,
@@ -125,7 +125,7 @@ class _ActionsContainer:
     def _pop_action_class(self, kwargs: Any, default: type[Action] | None = None) -> type[Action]: ...
     def _get_handler(self) -> Callable[[Action, Iterable[tuple[str, Action]]], Any]: ...
     def _check_conflict(self, action: Action) -> None: ...
-    def _handle_conflict_error(self, action: Action, conflicting_actions: Iterable[tuple[str, Action]]) -> NoReturn: ...
+    def _handle_conflict_error(self, action: Action, conflicting_actions: Iterable[tuple[str, Action]]) -> Never: ...
     def _handle_conflict_resolve(self, action: Action, conflicting_actions: Iterable[tuple[str, Action]]) -> None: ...
 
 @type_check_only
@@ -225,7 +225,7 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         title: str = "subcommands",
         description: str | None = None,
         prog: str | None = None,
-        action: type[Action] = ...,
+        action: str | type[Action] = ...,
         option_string: str = ...,
         dest: str | None = None,
         required: bool = False,
@@ -240,7 +240,7 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         description: str | None = None,
         prog: str | None = None,
         parser_class: type[_ArgumentParserT],
-        action: type[Action] = ...,
+        action: str | type[Action] = ...,
         option_string: str = ...,
         dest: str | None = None,
         required: bool = False,
@@ -266,8 +266,8 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
     def parse_known_args(self, *, namespace: _N) -> tuple[_N, list[str]]: ...
 
     def convert_arg_line_to_args(self, arg_line: str) -> list[str]: ...
-    def exit(self, status: int = 0, message: str | None = None) -> NoReturn: ...
-    def error(self, message: str) -> NoReturn: ...
+    def exit(self, status: int = 0, message: str | None = None) -> Never: ...
+    def error(self, message: str) -> Never: ...
 
     @overload
     def parse_intermixed_args(self, args: Iterable[str] | None = None, namespace: None = None) -> Namespace: ...
@@ -324,8 +324,8 @@ class HelpFormatter:
     _current_indent: int
     _level: int
     _action_max_length: int
-    _root_section: _Section
-    _current_section: _Section
+    _root_section: _Section  # pyrefly: ignore [unknown-name]
+    _current_section: _Section  # pyrefly: ignore [unknown-name]
     _whitespace_matcher: Pattern[str]
     _long_break_matcher: Pattern[str]
 
@@ -460,7 +460,7 @@ if sys.version_info >= (3, 12):
                 deprecated: bool = False,
             ) -> None: ...
             @overload
-            @deprecated("The `type`, `choices`, and `metavar` parameters are ignored and will be removed in Python 3.14.")
+            @deprecated("The `type`, `choices`, and `metavar` parameters are ignored; removed in Python 3.14.")
             def __init__(
                 self,
                 option_strings: Sequence[str],
@@ -485,7 +485,7 @@ if sys.version_info >= (3, 12):
                 help: str | None = None,
             ) -> None: ...
             @overload
-            @deprecated("The `type`, `choices`, and `metavar` parameters are ignored and will be removed in Python 3.14.")
+            @deprecated("The `type`, `choices`, and `metavar` parameters are ignored; removed in Python 3.14.")
             def __init__(
                 self,
                 option_strings: Sequence[str],
@@ -511,7 +511,7 @@ else:
             help: str | None = None,
         ) -> None: ...
         @overload
-        @deprecated("The `type`, `choices`, and `metavar` parameters are ignored and will be removed in Python 3.14.")
+        @deprecated("The `type`, `choices`, and `metavar` parameters are ignored; removed in Python 3.14.")
         def __init__(
             self,
             option_strings: Sequence[str],
@@ -532,7 +532,7 @@ class Namespace(_AttributeHolder):
     def __eq__(self, other: object) -> bool: ...
     __hash__: ClassVar[None]  # type: ignore[assignment]
 
-@deprecated("Deprecated since Python 3.14. Open files after parsing arguments instead.")
+@deprecated("Deprecated; may leave files open. Open files after parsing arguments instead.")
 class FileType:
     # undocumented
     _mode: str
@@ -558,7 +558,7 @@ class _ArgumentGroup(_ActionsContainer):
         conflict_handler: str = ...,
     ) -> None: ...
     @overload
-    @deprecated("Undocumented `prefix_chars` parameter is deprecated since Python 3.14.")
+    @deprecated("Undocumented `prefix_chars` parameter is deprecated.")
     def __init__(
         self,
         container: _ActionsContainer,

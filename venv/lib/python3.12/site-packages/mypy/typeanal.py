@@ -927,8 +927,12 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             if info.special_alias:
                 res, used_default = instantiate_type_alias(
                     info.special_alias,
-                    # TODO: should we allow NamedTuples generic in ParamSpec?
-                    self.anal_array(args, allow_unpack=True),
+                    self.anal_array(
+                        args,
+                        allow_unpack=True,
+                        allow_param_spec=True,
+                        allow_param_spec_literals=True,
+                    ),
                     self.fail,
                     self.note,
                     False,
@@ -953,8 +957,12 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             if info.special_alias:
                 res, used_default = instantiate_type_alias(
                     info.special_alias,
-                    # TODO: should we allow TypedDicts generic in ParamSpec?
-                    self.anal_array(args, allow_unpack=True),
+                    self.anal_array(
+                        args,
+                        allow_unpack=True,
+                        allow_param_spec=True,
+                        allow_param_spec_literals=True,
+                    ),
                     self.fail,
                     self.note,
                     False,
@@ -1048,6 +1056,13 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 fallback=Instance(sym.node.info, [], line=t.line, column=t.column),
                 line=t.line,
                 column=t.column,
+            )
+
+        if isinstance(sym.node, Var) and sym.node.is_sentinel:
+            typ = get_proper_type(sym.node.type)
+            assert isinstance(typ, LiteralType)
+            return LiteralType(
+                value=typ.value, fallback=typ.fallback, line=t.line, column=t.column
             )
 
         # None of the above options worked. We parse the args (if there are any)
@@ -1202,6 +1217,15 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                             "Arguments not allowed after ParamSpec.args", t, code=codes.VALID_TYPE
                         )
                     at = self.anal_type(ut, nested=nested, allow_unpack=False)
+                    if isinstance(at, Parameters):
+                        # A Parameters here comes from a misplaced Concatenate ending in
+                        # an explicit ellipsis, e.g. Callable[[Concatenate[int, ...]], None].
+                        self.fail(
+                            "Concatenate is only valid as the first argument to Callable",
+                            ut,
+                            code=codes.VALID_TYPE,
+                        )
+                        at = AnyType(TypeOfAny.from_error)
                 arg_types.append(at)
 
             if nested and arg_types:
@@ -2189,7 +2213,7 @@ def fix_instance(
             else:
                 unpacked = [arg]
             for arg in unpacked:
-                with state.strict_optional_set(options.strict_optional):
+                with state.strict_optional_set(True):
                     # Gradually expand defaults, as they may depend on previous variables.
                     if tv.has_default():
                         arg = expand_type(arg, env)

@@ -23,12 +23,14 @@ class Metrics:
         drones: Size of the fleet that was routed.
         total_moves: Number of individual drone moves performed.
         total_cost: Sum of the weighted entry costs paid by the fleet.
+        total_delivery: Sum over drones of the turn each was delivered.
     """
 
     turns: int
     drones: int
     total_moves: int
     total_cost: int
+    total_delivery: int
 
     @property
     def moves_per_turn(self) -> float:
@@ -43,14 +45,17 @@ class Metrics:
 
     @property
     def turns_per_drone(self) -> float:
-        """Average number of turns each drone spent travelling.
+        """Average turn on which a drone reached the end hub.
+
+        Every drone starts at turn 0, so this is how many turns each
+        one took on average, waiting included.
 
         Returns:
             The average, or 0.0 when there are no drones.
         """
         if self.drones == 0:
             return 0.0
-        return self.total_cost / self.drones
+        return self.total_delivery / self.drones
 
 
 class Simulator:
@@ -75,6 +80,10 @@ class Simulator:
     def validate(self, plan: Plan) -> Metrics:
         """Replay a plan, checking every movement and occupancy rule.
 
+        Zone occupancy is kept as a running count updated by each move,
+        so a turn costs time proportional to the moves in it rather
+        than to the size of the fleet.
+
         Args:
             plan: The plan to verify.
 
@@ -91,42 +100,44 @@ class Simulator:
             drone_id: start
             for drone_id in range(1, self.network.nb_drones + 1)
         }
+        occupancy: Counter[str] = Counter({start: len(position)})
         transit: dict[int, tuple[str, str]] = {}
-        delivered: set[int] = set()
+        delivered: dict[int, int] = {}
         link_use: Counter[tuple[str, int]] = Counter()
         total_cost = 0
 
         for turn in plan.turns:
             must_land = set(transit)
             seen: set[int] = set()
-            after = dict(position)
+            entered: set[str] = set()
 
             for move in turn.moves:
                 drone = move.drone_id
-                if drone in seen:
-                    self._fail(turn.index, f"D{drone} moves twice")
-                if drone in delivered:
-                    self._fail(turn.index, f"D{drone} already delivered")
+                self._check_mover(turn.index, move, position, seen,
+                                  delivered)
                 seen.add(drone)
-
                 dest = self.network.zone(move.zone)
-                if not dest.is_passable:
-                    self._fail(
-                        turn.index,
-                        f"D{drone} enters blocked zone {move.zone!r}",
-                    )
 
+                # The checks read position[drone] as it stood before
+                # this turn; it is only overwritten once they pass.
                 if move.in_flight:
                     self._depart(turn.index, move, position, transit,
                                  link_use)
-                    after[drone] = self.IN_FLIGHT
                 else:
                     self._arrive(turn.index, move, position, transit,
                                  must_land, link_use)
-                    after[drone] = move.zone
                     total_cost += dest.entry_cost
+                    entered.add(move.zone)
                     if move.zone == end:
-                        delivered.add(drone)
+                        delivered[drone] = turn.index
+
+                if position[drone] != self.IN_FLIGHT:
+                    occupancy[position[drone]] -= 1
+                if move.in_flight:
+                    position[drone] = self.IN_FLIGHT
+                else:
+                    position[drone] = move.zone
+                    occupancy[move.zone] += 1
 
             if must_land:
                 stuck = ", ".join(f"D{d}" for d in sorted(must_land))
@@ -134,12 +145,11 @@ class Simulator:
                     turn.index, f"{stuck} lingered on a connection"
                 )
 
-            self._check_occupancy(turn.index, after)
-            position = after
+            self._check_occupancy(turn.index, entered, occupancy)
 
         self._check_links(link_use)
 
-        missing = set(position) - delivered
+        missing = set(position) - delivered.keys()
         if missing:
             names = ", ".join(f"D{d}" for d in sorted(missing))
             raise SimulationError(f"never delivered: {names}")
@@ -149,7 +159,40 @@ class Simulator:
             drones=self.network.nb_drones,
             total_moves=plan.total_moves,
             total_cost=total_cost,
+            total_delivery=sum(delivered.values()),
         )
+
+    def _check_mover(
+        self,
+        index: int,
+        move: Move,
+        position: dict[int, str],
+        seen: set[int],
+        delivered: dict[int, int],
+    ) -> None:
+        """Check that a drone is allowed to make a move at all.
+
+        Args:
+            index: 1-based turn number, for error messages.
+            move: The move being checked.
+            position: Where every drone stood before this turn.
+            seen: Drones that already moved this turn.
+            delivered: Drones already at the end hub.
+
+        Raises:
+            SimulationError: If the drone does not exist, has already
+                moved this turn, was already delivered, or is heading
+                into a blocked zone.
+        """
+        drone = move.drone_id
+        if drone not in position:
+            self._fail(index, f"unknown drone D{drone}")
+        if drone in seen:
+            self._fail(index, f"D{drone} moves twice")
+        if drone in delivered:
+            self._fail(index, f"D{drone} already delivered")
+        if not self.network.zone(move.zone).is_passable:
+            self._fail(index, f"D{drone} enters blocked zone {move.zone!r}")
 
     def _depart(
         self,
@@ -251,24 +294,27 @@ class Simulator:
             )
         link_use[(link.name, index)] += 1
 
-    def _check_occupancy(self, index: int, after: dict[int, str]) -> None:
+    def _check_occupancy(
+        self, index: int, entered: set[str], occupancy: Counter[str]
+    ) -> None:
         """Check zone capacities on the state after a whole turn.
 
         Occupancy is never checked move by move: the subject says a
         drone leaving frees its space during the same turn, so a whole
-        corridor may shift forward at once.
+        corridor may shift forward at once. Only zones that received a
+        drone this turn can have gone over capacity, so only those are
+        checked.
 
         Args:
             index: 1-based turn number, for error messages.
-            after: Where every drone stands once the turn is applied.
+            entered: Zones at least one drone moved into this turn.
+            occupancy: How many drones each zone holds after the turn.
 
         Raises:
             SimulationError: If a zone is over capacity.
         """
-        counts = Counter(
-            name for name in after.values() if name != self.IN_FLIGHT
-        )
-        for name, count in counts.items():
+        for name in sorted(entered):
+            count = occupancy[name]
             capacity = self.network.zone(name).capacity
             if capacity != UNLIMITED and count > capacity:
                 self._fail(

@@ -9,10 +9,11 @@ import os
 import shutil
 import sys
 from abc import ABC, abstractmethod
+from collections import Counter
 
 from network import Network
 from plan import Plan
-from zone import UNLIMITED, Zone, ZoneType
+from zone import Zone, ZoneType
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -94,7 +95,8 @@ class GridRenderer(Renderer):
     with their ``color=`` tag, and annotated with how many drones they
     hold against their capacity. Drones crossing a connection towards
     a restricted zone are listed separately, since they occupy no zone
-    at all during that turn.
+    at all during that turn. Zones declared on coordinates another
+    zone already uses are listed below the grid, so none is hidden.
     """
 
     MIN_CELL = 5
@@ -115,6 +117,14 @@ class GridRenderer(Renderer):
         self.columns = self.max_x - self.min_x + 1
         self.cell = self._cell_width()
         self.color = self._supports_color()
+
+        self.at: dict[tuple[int, int], Zone] = {}
+        self.stacked: list[Zone] = []
+        for zone in zones:
+            if (zone.x, zone.y) in self.at:
+                self.stacked.append(zone)
+            else:
+                self.at[(zone.x, zone.y)] = zone
 
     # -- geometry -------------------------------------------------------
 
@@ -195,10 +205,26 @@ class GridRenderer(Renderer):
 
     # -- the frame ------------------------------------------------------
 
+    def _cell_at(self, x: int, y: int, occupancy: Counter[str]) -> str:
+        """Render the grid cell at some coordinates.
+
+        Args:
+            x: Column coordinate.
+            y: Row coordinate.
+            occupancy: How many drones each zone holds.
+
+        Returns:
+            The cell, blank when no zone sits there.
+        """
+        zone = self.at.get((x, y))
+        if zone is None:
+            return self._cell_for(None, 0)
+        return self._cell_for(zone, occupancy[zone.name])
+
     def _draw_turn(
         self,
         index: int,
-        occupancy: dict[str, int],
+        occupancy: Counter[str],
         flying: list[str],
         line: str,
     ) -> None:
@@ -210,18 +236,26 @@ class GridRenderer(Renderer):
             flying: Labels of drones crossing a connection.
             line: The raw output line for this turn.
         """
-        at = {(zone.x, zone.y): zone for zone in self.network.zones.values()}
         print(f"\n{BOLD if self.color else ''}turn {index}"
               f"{RESET if self.color else ''}")
         for y in range(self.max_y, self.min_y - 1, -1):
             row = "".join(
-                self._cell_for(
-                    at.get((x, y)), occupancy.get(
-                        at[(x, y)].name, 0) if (x, y) in at else 0
-                )
+                self._cell_at(x, y, occupancy)
                 for x in range(self.min_x, self.max_x + 1)
             )
             print(f"  {row.rstrip()}")
+        if self.stacked:
+            cells = ", ".join(
+                self._tint(
+                    f"{TYPE_MARK[zone.zone_type].strip()}{zone.name}"
+                    + (f":{occupancy[zone.name]}"
+                       if occupancy[zone.name] else ""),
+                    zone,
+                    bool(occupancy[zone.name]),
+                ) + f" at ({zone.x},{zone.y})"
+                for zone in self.stacked
+            )
+            print(f"  stacked: {cells}")
         if flying:
             print(f"  in flight: {', '.join(flying)}")
         if line:
@@ -239,21 +273,20 @@ class GridRenderer(Renderer):
             drone: start
             for drone in range(1, self.network.nb_drones + 1)
         }
+        occupancy: Counter[str] = Counter({start: len(position)})
         crossing: dict[int, str] = {}
 
         print(self._legend())
         for turn in plan.turns:
             for move in turn.moves:
+                if move.drone_id in position:
+                    occupancy[position.pop(move.drone_id)] -= 1
                 if move.in_flight:
                     crossing[move.drone_id] = move.connection or ""
-                    position.pop(move.drone_id, None)
                 else:
                     crossing.pop(move.drone_id, None)
                     position[move.drone_id] = move.zone
-
-            occupancy: dict[str, int] = {}
-            for name in position.values():
-                occupancy[name] = occupancy.get(name, 0) + 1
+                    occupancy[move.zone] += 1
 
             flying = [
                 f"D{drone}->{link}"
@@ -261,19 +294,5 @@ class GridRenderer(Renderer):
             ]
             self._draw_turn(turn.index, occupancy, flying, str(turn))
 
-        arrived = sum(1 for name in position.values() if name == end)
-        print(f"\n{arrived}/{self.network.nb_drones} drones delivered"
-              f" in {plan.turn_count} turns")
-
-    def describe_capacities(self) -> str:
-        """Summarise which zones are capacity limited.
-
-        Returns:
-            A one line summary, useful above the animation.
-        """
-        limited = [
-            f"{zone.name}({zone.capacity})"
-            for zone in self.network.zones.values()
-            if zone.capacity != UNLIMITED and zone.capacity > 1
-        ]
-        return "wide zones: " + (", ".join(limited) or "none")
+        print(f"\n{occupancy[end]}/{self.network.nb_drones} drones"
+              f" delivered in {plan.turn_count} turns")

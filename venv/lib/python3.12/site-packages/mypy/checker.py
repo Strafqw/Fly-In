@@ -291,10 +291,12 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    extend_args_for_prefix_and_suffix,
     find_unpack_in_list,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
+    get_variadic_item,
     instance_cache,
     is_literal_type,
     is_named_instance,
@@ -604,18 +606,32 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             with self.tscope.module_scope(self.tree.fullname):
                 with self.enter_partial_types(), self.binder.top_frame_context():
                     marked_unreachable = False
+                    reported_unreachable = False
                     for d in self.tree.defs:
                         if self.binder.is_unreachable():
+                            finish = False
                             if not marked_unreachable:
                                 self.mark_unreachable(self.tree.defs, after=d)
                                 marked_unreachable = True
                             if not self.should_report_unreachable_issues():
-                                break
-                            if not self.is_noop_for_reachability(d):
+                                finish = True
+                            if (
+                                not finish
+                                and not reported_unreachable
+                                and not self.is_noop_for_reachability(d)
+                            ):
                                 self.msg.unreachable_statement(d)
+                                self.binder.suppress_unreachable_warnings()
+                                finish = True
+                                reported_unreachable = True
+
+                            if finish and not self.options.check_unreachable:
                                 break
-                        else:
-                            self.accept(d)
+
+                            if not self.options.check_unreachable:
+                                continue
+
+                        self.accept(d)
 
                 assert not self.current_node_deferred
 
@@ -1487,7 +1503,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # TODO: check recursively for inner type variables
                         if (
                             arg_type.variance == COVARIANT
-                            and defn.name not in ("__init__", "__new__", "__post_init__")
+                            and defn.name
+                            not in {"__init__", "__new__", "__post_init__", "__replace__"}
                             and not is_private(defn.name)  # private methods are not inherited
                             and (i != 0 or not found_self)
                         ):
@@ -3302,20 +3319,34 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             self.binder.unreachable()
             return
         marked_unreachable = False
+        reported_unreachable = False
         for s in b.body:
             if self.binder.is_unreachable():
+                finish = False
                 if self.scope.top_level_function() is None and not marked_unreachable:
                     self.mark_unreachable(b.body, after=s)
                     marked_unreachable = True
                 if not self.should_report_unreachable_issues():
-                    break
-                if not self.is_noop_for_reachability(s):
+                    finish = True
+                if (
+                    not finish
+                    and not reported_unreachable
+                    and not self.is_noop_for_reachability(s)
+                ):
                     self.msg.unreachable_statement(s)
+                    self.binder.suppress_unreachable_warnings()
+                    finish = True
+                    reported_unreachable = True
+
+                if finish and not self.options.check_unreachable:
                     break
-            else:
-                self.accept(s)
-                # Clear expression cache after each statement to avoid unlimited growth.
-                self.expr_checker.expr_cache.clear()
+
+                if not self.options.check_unreachable:
+                    continue
+
+            self.accept(s)
+            # Clear expression cache after each statement to avoid unlimited growth.
+            self.expr_checker.expr_cache.clear()
 
     def should_report_unreachable_issues(self) -> bool:
         return (
@@ -4360,6 +4391,36 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             res.append(lv)
         return res
 
+    def adjust_rvalue_type_if_possible(
+        self, rvalue_type: TupleType, lvalues: list[Lvalue]
+    ) -> TupleType:
+        """Adjust type of rvalue to match the shape/structure of lvalues.
+
+        Currently, we only allow this if the rvalue type has contains *tuple[Any, ...].
+        """
+        right_variadic = get_variadic_item(rvalue_type)
+        if right_variadic is None:
+            return rvalue_type
+        right_unpack_index, right_item = right_variadic
+        if not isinstance(get_proper_type(right_item), AnyType):
+            return rvalue_type
+        left_star_index = next(
+            (i for i, lv in enumerate(lvalues) if isinstance(lv, StarExpr)), None
+        )
+        if left_star_index is None:
+            extra = len(lvalues) - len(rvalue_type.items) + 1
+            if extra < 0:
+                return rvalue_type
+            return rvalue_type.copy_modified(
+                items=rvalue_type.items[:right_unpack_index]
+                + [right_item] * extra
+                + rvalue_type.items[right_unpack_index + 1 :]
+            )
+        new_items = extend_args_for_prefix_and_suffix(
+            tuple(rvalue_type.items), left_star_index, len(lvalues) - left_star_index - 1
+        )
+        return rvalue_type.copy_modified(items=list(new_items))
+
     def check_multi_assignment_from_tuple(
         self,
         lvalues: list[Lvalue],
@@ -4370,6 +4431,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         infer_lvalue_type: bool = True,
     ) -> None:
         rvalue_unpack = find_unpack_in_list(rvalue_type.items)
+        if rvalue_unpack is not None:
+            rvalue_type = self.adjust_rvalue_type_if_possible(rvalue_type, lvalues)
+            rvalue_unpack = find_unpack_in_list(rvalue_type.items)
         if self.check_rvalue_count_in_assignment(
             lvalues, len(rvalue_type.items), context, rvalue_unpack=rvalue_unpack
         ):
@@ -4411,7 +4475,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if isinstance(reinferred_rvalue_type, TupleType):
                     # This branch will usually be taken, but in some cases context can
                     # e.g. select a different overload
+                    # TODO: reinferred tuple may be of a different (invalid) shape.
                     rvalue_type = reinferred_rvalue_type
+
+            # Reinferring the type can undo the shape adjustment, so do it again.
+            rvalue_unpack = find_unpack_in_list(rvalue_type.items)
+            if rvalue_unpack is not None:
+                rvalue_type = self.adjust_rvalue_type_if_possible(rvalue_type, lvalues)
 
             left_rv_types, star_rv_types, right_rv_types = self.split_around_star(
                 rvalue_type.items, star_index, len(lvalues)
@@ -5161,12 +5231,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         new_type = self.named_generic_type(typename, [key_type, value_type])
                         self.replace_partial_type(var, new_type, partial_types)
 
-    def type_requires_usage(self, typ: Type) -> tuple[str, ErrorCode] | None:
-        """Some types require usage in all cases. The classic example is
-        an unused coroutine.
+    def type_requires_usage(self, typ: Type, s: ExpressionStmt) -> tuple[str, ErrorCode] | None:
+        """Some types require usage in basically all cases. The classic
+        example is an unused coroutine.
 
         In the case that it does require usage, returns a note to attach
-        to the error message.
+        to the error message. We special case somethings that return
+        awaitables because in those particular cases we can guarantee
+        it's safe.
         """
         proper_type = get_proper_type(typ)
         if isinstance(proper_type, Instance):
@@ -5175,12 +5247,24 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if proper_type.type.fullname == "typing.Coroutine":
                 return ("Are you missing an await?", UNUSED_COROUTINE)
             if proper_type.type.get("__await__") is not None:
-                return ("Are you missing an await?", UNUSED_AWAITABLE)
+                # this is quite ad-hoc, but there's no good way around
+                # this. the alternative is a hardcoded list of
+                # TaskGroups and their respective functions, but that's
+                # a lot of maintenance!
+                if isinstance(s.expr, CallExpr) and isinstance(s.expr.callee, MemberExpr):
+                    called_on = get_proper_type(self.expr_checker.accept(s.expr.callee.expr))
+                    is_a_taskgroup = isinstance(
+                        called_on, Instance
+                    ) and called_on.type.fullname.endswith(".TaskGroup")
+                else:
+                    is_a_taskgroup = False
+                if not is_a_taskgroup:
+                    return ("Are you missing an await?", UNUSED_AWAITABLE)
         return None
 
     def visit_expression_stmt(self, s: ExpressionStmt) -> None:
         expr_type = self.expr_checker.accept(s.expr, allow_none_return=True, always_allow_any=True)
-        error_note_and_code = self.type_requires_usage(expr_type)
+        error_note_and_code = self.type_requires_usage(expr_type, s)
         if error_note_and_code:
             error_note, code = error_note_and_code
             self.fail(
@@ -5476,6 +5560,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     self.accept(s.finally_body)
 
         if s.finally_body:
+            previously_suppressed = self.binder.is_unreachable_warning_suppressed()
             # Then we try again for the more restricted set of options
             # that can fall through. (Why do we need to check the
             # finally clause twice? Depending on whether the finally
@@ -5492,6 +5577,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 with IterationErrorWatcher(self.msg.errors, iter_errors):
                     self.accept(s.finally_body)
             self.msg.iteration_dependent_errors(iter_errors)
+
+            if not previously_suppressed:
+                # The finally body might have warned about unreachability,
+                # but we still want anything afterwards to warn too.
+                self.binder.frames[-1].suppress_unreachable_warnings = False
 
     def visit_try_without_finally(self, s: TryStmt, try_frame: bool) -> None:
         """Type check a try statement, ignoring the finally block.
@@ -6075,6 +6165,12 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         sub_patterns_map: dict[Expression, Type] = {}
         typ_ = get_proper_type(typ)
         if isinstance(expr, TupleExpr) and isinstance(typ_, TupleType):
+            if any(isinstance(item, StarExpr) for item in expr.items):
+                # For a starred item (e.g. `*bar`), there's no one-to-one correspondence
+                # between expr.items and typ_.items, we are returning early to avoid an
+                # assertion crash. See: https://github.com/python/mypy/issues/21468.
+                return sub_patterns_map
+
             # When matching a tuple expression with a sequence pattern, narrow individual tuple items
             assert len(expr.items) == len(typ_.items)
             for item_expr, item_typ in zip(expr.items, typ_.items):

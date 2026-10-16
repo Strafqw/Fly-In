@@ -67,6 +67,7 @@ T = TypeVar("T")
 
 JsonDict: _TypeAlias = dict[str, Any]
 
+
 # The set of all valid expressions that can currently be contained
 # inside of a Literal[...].
 #
@@ -97,7 +98,12 @@ JsonDict: _TypeAlias = dict[str, Any]
 #
 # Note: Float values are only used internally. They are not accepted within
 # Literal[...].
-LiteralValue: _TypeAlias = int | str | bool | float
+class SentinelValue(NamedTuple):
+    fullname: str
+    name: str
+
+
+LiteralValue: _TypeAlias = int | str | bool | float | SentinelValue
 
 
 TUPLE_NAMES: Final = ("builtins.tuple", "typing.Tuple")
@@ -110,6 +116,12 @@ TYPE_VAR_LIKE_NAMES: Final = (
     "typing_extensions.ParamSpec",
     "typing.TypeVarTuple",
     "typing_extensions.TypeVarTuple",
+)
+
+SENTINEL_TYPE_NAMES: Final = (
+    "builtins.sentinel",
+    "typing_extensions.sentinel",
+    "typing_extensions.Sentinel",
 )
 
 TYPED_NAMEDTUPLE_NAMES: Final = ("typing.NamedTuple", "typing_extensions.NamedTuple")
@@ -209,6 +221,12 @@ _dummy: Final[Any] = object()
 
 # A placeholder for int parameters
 _dummy_int: Final = -999999
+
+# Maximum protocol subtyping assumptions depth. We need this to avoid infinite
+# recursion for protocols that are genuinely undecidable, see testDivergingProtocol.
+# We set a conservative cut-off, since some numerical libraries currently
+# use ~10 assumptions, and we want to avoid false negatives with them.
+MAX_PROTOCOL_DEPTH: Final = 20
 
 
 class TypeOfAny:
@@ -2934,9 +2952,6 @@ class TupleType(ProperType):
         if fallback is None:
             fallback = self.partial_fallback
 
-        if stride == 0:
-            return None
-
         if any(isinstance(t, UnpackType) for t in self.items):
             total = len(self.items)
             unpack_index = find_unpack_in_list(self.items)
@@ -2977,7 +2992,7 @@ class TupleType(ProperType):
                 else:
                     return None
             else:
-                # TODO: there some additional cases we can support for homogeneous variadic
+                # TODO: there are some additional cases we can support for homogeneous variadic
                 # items, we can "eat away" finite number of items.
                 return None
         else:
@@ -3342,11 +3357,15 @@ class LiteralType(ProperType):
     #       almost no test cases where we would redundantly compute
     #       `can_be_false`/`can_be_true`.
     def can_be_false_default(self) -> bool:
+        if isinstance(self.value, SentinelValue):
+            return False
         if self.fallback.type.is_enum:
             return self.fallback.can_be_false
         return not self.value
 
     def can_be_true_default(self) -> bool:
+        if isinstance(self.value, SentinelValue):
+            return True
         if self.fallback.type.is_enum:
             return self.fallback.can_be_true
         return bool(self.value)
@@ -3367,6 +3386,9 @@ class LiteralType(ProperType):
     def is_enum_literal(self) -> bool:
         return self.fallback.type.is_enum
 
+    def is_sentinel_literal(self) -> bool:
+        return isinstance(self.value, SentinelValue)
+
     def value_repr(self) -> str:
         """Returns the string representation of the underlying type.
 
@@ -3374,6 +3396,9 @@ class LiteralType(ProperType):
         except it includes some additional logic to correctly handle cases
         where the value is a string, byte string, a unicode string, or an enum.
         """
+        if isinstance(self.value, SentinelValue):
+            return self.value.name
+
         raw = repr(self.value)
         fallback_name = self.fallback.type.fullname
 
@@ -3392,16 +3417,19 @@ class LiteralType(ProperType):
             return raw
 
     def serialize(self) -> JsonDict | str:
-        return {
-            ".class": "LiteralType",
-            "value": self.value,
-            "fallback": self.fallback.serialize(),
-        }
+        value: LiteralValue | JsonDict = self.value
+        if isinstance(value, SentinelValue):
+            value = {".class": "SentinelValue", "fullname": value.fullname, "name": value.name}
+        return {".class": "LiteralType", "value": value, "fallback": self.fallback.serialize()}
 
     @classmethod
     def deserialize(cls, data: JsonDict) -> LiteralType:
         assert data[".class"] == "LiteralType"
-        return LiteralType(value=data["value"], fallback=Instance.deserialize(data["fallback"]))
+        value = data["value"]
+        if isinstance(value, dict):
+            assert value[".class"] == "SentinelValue"
+            value = SentinelValue(value["fullname"], value["name"])
+        return LiteralType(value=value, fallback=Instance.deserialize(data["fallback"]))
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, LITERAL_TYPE)
@@ -3414,7 +3442,8 @@ class LiteralType(ProperType):
         assert read_tag(data) == INSTANCE
         fallback = Instance.read(data)
         tag = read_tag(data)
-        ret = LiteralType(read_literal(data, tag), fallback)
+        value = read_literal(data, tag)
+        ret = LiteralType(value, fallback)
         assert read_tag(data) == END_TAG
         return ret
 
@@ -4077,6 +4106,8 @@ class TypeStrVisitor(SyntheticTypeVisitor[str]):
         return repr(t.literal_value)
 
     def visit_literal_type(self, t: LiteralType, /) -> str:
+        if isinstance(t.value, SentinelValue):
+            return t.value_repr()
         return f"Literal[{t.value_repr()}]"
 
     def visit_union_type(self, t: UnionType, /) -> str:
@@ -4228,7 +4259,15 @@ def has_recursive_types(typ: Type) -> bool:
 def split_with_prefix_and_suffix(
     types: tuple[Type, ...], prefix: int, suffix: int
 ) -> tuple[tuple[Type, ...], tuple[Type, ...], tuple[Type, ...]]:
-    if len(types) <= prefix + suffix:
+    # The caller must validate that the split can be satisfied, i.e. there is
+    # enough capacity in either initial type list or there is a variadic unpack.
+    # Otherwise, this function may return nonsensical result.
+    # TODO: should we add an assert here?
+    needs_extend = False
+    index = find_unpack_in_list(types)
+    if index is not None:
+        needs_extend = index < prefix or len(types) - index - 1 < suffix
+    if needs_extend:
         types = extend_args_for_prefix_and_suffix(types, prefix, suffix)
     if suffix:
         return types[:prefix], types[prefix:-suffix], types[-suffix:]
@@ -4418,6 +4457,20 @@ def type_vars_as_args(type_vars: Sequence[TypeVarLikeType]) -> tuple[Type, ...]:
         else:
             args.append(tv)
     return tuple(args)
+
+
+def get_variadic_item(tup: TupleType) -> tuple[int, Type] | None:
+    """If this is tuple[X, *tuple[Y, ...], Z], return Y, otherwise None."""
+    unpack_index = find_unpack_in_list(tup.items)
+    if unpack_index is None:
+        return None
+    unpack = tup.items[unpack_index]
+    assert isinstance(unpack, UnpackType)
+    unpacked = get_proper_type(unpack.type)
+    if not isinstance(unpacked, Instance):
+        return None
+    assert unpacked.type.fullname == "builtins.tuple"
+    return unpack_index, unpacked.args[0]
 
 
 # See docstring for mypy/cache.py for reserved tag ranges.
