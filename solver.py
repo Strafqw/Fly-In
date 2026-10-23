@@ -50,12 +50,12 @@ class Solver(ABC):
             The plan, with an empty turn wherever nobody moves.
         """
         last = max(by_turn, default=0)
-        return Plan(tuple(
-            Turn(index, tuple(sorted(
-                by_turn.get(index, []), key=lambda move: move.drone_id
-            )))
-            for index in range(1, last + 1)
-        ))
+        turns: list[Turn] = []
+        for index in range(1, last + 1):
+            moves = by_turn.get(index, [])
+            moves = sorted(moves, key=lambda move: move.drone_id)
+            turns.append(Turn(index, tuple(moves)))
+        return Plan(tuple(turns))
 
 
 class ShortestPathSolver(Solver):
